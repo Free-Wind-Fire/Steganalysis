@@ -1,0 +1,240 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from itertools import product
+from utils1 import ScaledDotProductAttention,BilinearInteractionV2,get_activation,SqueezeExcitation
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+
+
+class CenterDivAttention(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.V_map = nn.Linear(d_model, d_model, bias=False)
+        self.K_map = nn.Linear(d_model, d_model, bias=False)
+        self.Q_map = nn.Linear(d_model, d_model, bias=False)
+        self.center_map = nn.Linear(d_model, d_model)
+        self.eps = eps
+        self.sigma = 1.0
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.center = nn.Parameter(torch.empty(1, 1, d_model))
+        nn.init.xavier_uniform_(self.center)
+
+    def rbf_kernel(self, X, c): # [B,T,D]
+        diff2 = (X - c) ** 2       # [B,T,D]
+        return torch.exp(-diff2 / (2 * self.sigma ** 2))  # [B,T,D]
+
+    def forward(self, X):
+        B, T, D = X.shape
+        Q = self.Q_map(X)
+        K = self.K_map(X)
+        # token-token similarity matrix
+        Q_ker = self.rbf_kernel(Q, self.center)
+        K_ker = self.rbf_kernel(K, self.center)
+        S = torch.matmul(Q_ker, K_ker.transpose(1, 2)) / (D ** 0.5)   # [B,T,T]
+        V = self.V_map(X)
+        V_ker = self.rbf_kernel(V, self.center)
+        ###########################################################################
+        sim = F.cosine_similarity(X, self.center, dim=-1)               # [B,T]
+        # Denominator: A larger denominator—i.e., 
+        #one with greater absolute deviation from the center—results in a correspondingly smaller weight.
+        denom = (1.0 - sim).unsqueeze(1) + self.eps           # [B,1,T]
+        denom = denom ** 0.5
+        scores = S / denom                                         # [B,T,T]  
+        attn_weights = F.softmax(scores, dim=-1)                  # [B,T,T]
+        
+        output = torch.matmul(attn_weights,V)
+        return output, attn_weights
+
+class MultiLayerCenterAttention(nn.Module):
+    def __init__(self, d_model, num_layers=3):
+        super(MultiLayerCenterAttention, self).__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([CenterDivAttention(d_model) for _ in range(num_layers)])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
+        self.activation = nn.ReLU()
+        #self.activation = nn.ReLU()
+
+    def forward(self, X):
+        output = X
+        all_weights = []
+        for i in range(self.num_layers):
+            attn_out, attn_weights = self.layers[i](output)
+            #residual + LayerNorm
+            output = self.norms[i](output + attn_out)
+            #output = output + attn_out
+
+            output = self.activation(output)
+            all_weights.append(attn_weights)
+        return output
+
+class AutoInt_steganalysis(nn.Module):
+
+    def __init__(self,):
+        super(AutoInt_steganalysis, self).__init__()
+        self.embedding1 = nn.Embedding(513,10,padding_idx=512)
+        self.embedding2 = nn.Embedding(513,10,padding_idx=512)
+        self.embedding3 = nn.Embedding(513,10,padding_idx=512)
+        self.embedding4 = nn.Embedding(513,10,padding_idx=512)
+        self.embedding5 = nn.Embedding(513,10,padding_idx=512)
+        ######################################################################################
+        self.embedding_dim = 10
+        self.attention_dim = 10
+        self.attention_layers = 2
+        self.attention_layers1= 2
+        self.num1 = 5
+        self.num2 = 5
+        self.gnn_layers =1
+        ########################################################################################
+        self.CenterAwareAttention = MultiLayerCenterAttention(d_model = 5*self.embedding_dim, num_layers=2)
+        ######################################################################################
+        self.bn = nn.BatchNorm1d(num_features=self.embedding_dim*self.num1)
+        self.dp = nn.Dropout(0.3)
+        self.fc = nn.Linear(self.embedding_dim*self.num1,2)
+        self.fignn = FiGNN_Layer(self.num2, 
+                                 self.embedding_dim,
+                                 gnn_layers=self.gnn_layers,
+                                 reuse_graph_layer=True,
+                                 use_gru=False,
+                                 use_residual=True)
+        #################################################################################
+
+    def forward(self, x):
+        x = x.long()
+        x1 = x[:, :, 0]
+        x2 = x[:, :, 1]
+        x3 = x[:, :, 2]
+        x4 = x[:, :, 3]
+        x5 = x[:, :, 4]
+        init_embed1 = self.embedding1(x1)
+        init_embed2 = self.embedding2(x2)
+        init_embed3 = self.embedding3(x3)
+        init_embed4 = self.embedding4(x4)
+        init_embed5 = self.embedding5(x5)
+        gnn_outputs = []
+        bs, l, k = init_embed1.shape
+        for t in range(l):
+            xt_1 = init_embed1[:,t].unsqueeze(1)  
+            xt_2 = init_embed2[:,t].unsqueeze(1)  
+            xt_3 = init_embed3[:,t].unsqueeze(1)  
+            xt_4 = init_embed4[:,t].unsqueeze(1)  
+            xt_5 = init_embed5[:,t].unsqueeze(1)  
+            each_step_t = torch.cat([xt_1,xt_2,xt_3,xt_4,xt_5],dim=1)
+            gnn_outputs.append(each_step_t)
+        #################################################################################
+        gat_seq = torch.stack(gnn_outputs, dim=1)  
+        #####################################################
+        out1 = gat_seq.view(x.shape[0]*x.shape[1], 5, -1)
+        out2 = self.fignn(out1)
+        #####################################################
+        gat_seq_1 = out2.reshape(x.shape[0],x.shape[1],-1)
+        ################################################################################
+        attention_out = self.CenterAwareAttention(gat_seq_1)
+        pooled = attention_out.mean(dim=1) # [B, T, H]
+        #####################################################################################
+        final_out = self.bn(pooled)
+        y_pred = self.fc(final_out)
+        return y_pred
+
+class FiGNN_Layer(nn.Module):
+    def __init__(self, 
+                 num_fields, 
+                 embedding_dim,
+                 gnn_layers=3,
+                 reuse_graph_layer=False,
+                 use_gru=True,
+                 use_residual=True):
+        super(FiGNN_Layer, self).__init__()
+        self.num_fields = num_fields
+        self.embedding_dim = embedding_dim
+        self.gnn_layers = gnn_layers
+        self.use_residual = use_residual
+        self.reuse_graph_layer = reuse_graph_layer
+        if reuse_graph_layer:
+            self.gnn = GraphLayer(num_fields, embedding_dim)
+            self.gate_h = GateNN(self.num_fields*self.embedding_dim, output_dim=self.num_fields*self.embedding_dim)
+            self.gate_a = GateNN(self.num_fields*self.embedding_dim, output_dim=self.num_fields*self.embedding_dim)
+        else:
+            self.gnn = nn.ModuleList([GraphLayer(num_fields, embedding_dim)
+                                      for _ in range(gnn_layers)])
+        self.gru = nn.GRUCell(embedding_dim, embedding_dim) if use_gru else None
+        self.src_nodes, self.dst_nodes = zip(*list(product(range(num_fields), repeat=2)))
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.01)
+        self.W_attn = nn.Linear(embedding_dim * 2, 1, bias=False)
+
+    def build_graph_with_attention(self, feature_emb):
+        src_emb = feature_emb[:, self.src_nodes, :]
+        dst_emb = feature_emb[:, self.dst_nodes, :]
+        concat_emb = torch.cat([src_emb, dst_emb], dim=-1)
+        alpha = self.leaky_relu(self.W_attn(concat_emb))
+        alpha = alpha.view(-1, self.num_fields, self.num_fields)
+        mask = torch.eye(self.num_fields).to(feature_emb.device)
+        alpha = alpha.masked_fill(mask.bool(), float('-inf'))
+        graph = F.softmax(alpha, dim=-1) # batch x field x field without self-loops
+        return graph
+
+    def forward(self, feature_emb):
+        g = self.build_graph_with_attention(feature_emb)
+        h = feature_emb
+        for i in range(self.gnn_layers):
+            if self.reuse_graph_layer:
+                a = self.gnn(g, h)
+            else:
+                a = self.gnn[i](g, h)
+            if self.gru is not None:
+                a = a.view(-1, self.embedding_dim)
+                h = h.view(-1, self.embedding_dim)
+                h = self.gru(a, h)
+                h = h.view(-1, self.num_fields, self.embedding_dim)
+            #else:
+                #h = a + h
+            if self.use_residual:
+                gate_hh = self.gate_h(a.flatten(start_dim=1))
+                re_h = (gate_hh*(a.flatten(start_dim=1))).reshape(a.shape[0],self.num_fields,-1)
+                gate_fea = self.gate_a(h.flatten(start_dim=1))
+                re_fea = (gate_fea*(h.flatten(start_dim=1))).reshape(h.shape[0],self.num_fields,-1)
+                h = re_h + re_fea
+                #h += feature_emb
+        return h
+
+class GraphLayer(nn.Module):
+    def __init__(self, num_fields, embedding_dim):
+        super(GraphLayer, self).__init__()
+        self.W_in = torch.nn.Parameter(torch.Tensor(num_fields, embedding_dim, embedding_dim))
+        self.W_out = torch.nn.Parameter(torch.Tensor(num_fields, embedding_dim, embedding_dim))
+        nn.init.xavier_normal_(self.W_in)
+        nn.init.xavier_normal_(self.W_out)
+        self.bias_p = nn.Parameter(torch.zeros(embedding_dim))
+
+    def forward(self, g, h):
+        h_out = torch.matmul(self.W_out, h.unsqueeze(-1)).squeeze(-1) # broadcast multiply
+        aggr = torch.bmm(g, h_out)
+        a = torch.matmul(self.W_in, aggr.unsqueeze(-1)).squeeze(-1) + self.bias_p
+        return a
+
+class GateNN(nn.Module):
+    def __init__(self, 
+                 input_dim,
+                 output_dim,
+                 hidden_dim=None,
+                 hidden_activation="ReLU",
+                 dropout=0.0,
+                 batch_norm=False):
+        super(GateNN, self).__init__()
+        if hidden_dim is None:
+            hidden_dim = output_dim
+        gate_layers = [nn.Linear(input_dim, hidden_dim)]
+        if batch_norm:
+            gate_layers.append(nn.BatchNorm1d(hidden_dim))
+        gate_layers.append(get_activation(hidden_activation))
+        if dropout > 0:
+            gate_layers.append(nn.Dropout(dropout))
+        gate_layers.append(nn.Linear(hidden_dim, output_dim))
+        self.gate = nn.Sequential(*gate_layers)
+
+    def forward(self, inputs):
+        return self.gate(inputs).sigmoid() * 2
+
+
+
+    
